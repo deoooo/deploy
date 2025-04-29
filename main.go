@@ -163,18 +163,20 @@ func BuildJenkinsJob(jobName string, params map[string]string, err error, jenkin
 	}
 
 	queueID, err := job.InvokeSimple(ctx, params)
-
 	if err != nil {
 		log.Fatalf("Failed to trigger build: %s", err)
 	}
 
 	fmt.Println("Triggered building", queueID)
 
-	//build, err := job.GetBuild(ctx, queueID)
 	build, err := jenkins.GetBuildFromQueueID(ctx, queueID)
 	if err != nil {
 		log.Fatalf("Failed to get build: %s", err)
 	}
+
+	startTime := time.Now()
+	lastLogLength := 0
+	shouldShowLogs := false
 
 	// Wait for build to finish
 	for build.IsRunning(ctx) {
@@ -182,6 +184,22 @@ func BuildJenkinsJob(jobName string, params map[string]string, err error, jenkin
 		_, err := build.Poll(ctx)
 		if err != nil {
 			log.Fatalf("Failed to poll build: %s", err)
+		}
+
+		// Check if 30 seconds have passed
+		if !shouldShowLogs && time.Since(startTime) > 30*time.Second {
+			shouldShowLogs = true
+			fmt.Println("\nBuild is taking longer than 30 seconds. Showing real-time logs:")
+		}
+
+		// If we should show logs, get and display new content
+		if shouldShowLogs {
+			logs := build.GetConsoleOutput(ctx)
+			if len(logs) > lastLogLength {
+				newLogs := logs[lastLogLength:]
+				fmt.Print(newLogs)
+				lastLogLength = len(logs)
+			}
 		}
 	}
 

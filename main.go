@@ -5,8 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"github.com/bndr/gojenkins"
-	"gopkg.in/yaml.v2"
 	"io/ioutil"
 	"log"
 	"os"
@@ -14,6 +12,13 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/bndr/gojenkins"
+	"gopkg.in/yaml.v2"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
 )
 
 // Config represents the structure of the YAML configuration file
@@ -23,9 +28,20 @@ type Project struct {
 }
 
 type Env struct {
-	Name    string  `yaml:"name"`
-	JobName string  `yaml:"job_name"`
-	Params  []Param `yaml:"params,omitempty"`
+	Name    string    `yaml:"name"`
+	JobName string    `yaml:"job_name"`
+	Params  []Param   `yaml:"params,omitempty"`
+	K8s     K8sConfig `yaml:"k8s,omitempty"`
+}
+
+type K8sConfig struct {
+	Namespace  string `yaml:"namespace"`
+	Deployment string `yaml:"deployment"`
+	ConfigPath string `yaml:"config_path,omitempty"`
+}
+
+type GlobalK8sConfig struct {
+	ConfigPath string `yaml:"config_path"`
 }
 
 type Param struct {
@@ -34,10 +50,11 @@ type Param struct {
 }
 
 type Config struct {
-	JenkinsURL string    `yaml:"jenkins_url"`
-	Username   string    `yaml:"username"`
-	APIToken   string    `yaml:"api_token"`
-	Projects   []Project `yaml:"projects"`
+	JenkinsURL string          `yaml:"jenkins_url"`
+	Username   string          `yaml:"username"`
+	APIToken   string          `yaml:"api_token"`
+	K8s        GlobalK8sConfig `yaml:"k8s"`
+	Projects   []Project       `yaml:"projects"`
 }
 
 // LoadConfig loads the configuration from the specified YAML file
@@ -120,7 +137,7 @@ func main() {
 
 	fmt.Println("Successfully connected to Jenkins")
 
-	BuildJenkinsJob(jobName, params, err, jenkins, ctx)
+	BuildJenkinsJob(jobName, params, err, jenkins, ctx, env, config)
 }
 
 func parseParams(env Env) map[string]string {
@@ -153,9 +170,12 @@ func getBranchName() string {
 	return branchName
 }
 
-func BuildJenkinsJob(jobName string, params map[string]string, err error, jenkins *gojenkins.Jenkins, ctx context.Context) {
+func BuildJenkinsJob(jobName string, params map[string]string, err error, jenkins *gojenkins.Jenkins, ctx context.Context, env Env, config *Config) {
+	startTime := time.Now().Local()
+	fmt.Printf("[%s] Starting Jenkins build job: %s\n", startTime.Format("2006-01-02 15:04:05"), jobName)
+
 	paramJSON, _ := json.Marshal(params)
-	fmt.Printf("Triggering build job: %s params: %s\n", jobName, paramJSON)
+	fmt.Printf("[%s] Build parameters: %s\n", time.Now().Local().Format("2006-01-02 15:04:05"), paramJSON)
 
 	job, err := jenkins.GetJob(ctx, jobName)
 	if err != nil {
@@ -167,14 +187,14 @@ func BuildJenkinsJob(jobName string, params map[string]string, err error, jenkin
 		log.Fatalf("Failed to trigger build: %s", err)
 	}
 
-	fmt.Println("Triggered building", queueID)
+	fmt.Printf("[%s] Build triggered with queue ID: %d\n", time.Now().Local().Format("2006-01-02 15:04:05"), queueID)
 
 	build, err := jenkins.GetBuildFromQueueID(ctx, queueID)
 	if err != nil {
 		log.Fatalf("Failed to get build: %s", err)
 	}
 
-	startTime := time.Now()
+	buildStartTime := time.Now()
 	lastLogLength := 0
 	shouldShowLogs := false
 
@@ -187,9 +207,9 @@ func BuildJenkinsJob(jobName string, params map[string]string, err error, jenkin
 		}
 
 		// Check if 30 seconds have passed
-		if !shouldShowLogs && time.Since(startTime) > 30*time.Second {
+		if !shouldShowLogs && time.Since(buildStartTime) > 30*time.Second {
 			shouldShowLogs = true
-			fmt.Println("\nBuild is taking longer than 30 seconds. Showing real-time logs:")
+			fmt.Printf("\n[%s] Build is taking longer than 30 seconds. Showing real-time logs:\n", time.Now().Local().Format("2006-01-02 15:04:05"))
 		}
 
 		// If we should show logs, get and display new content
@@ -204,13 +224,105 @@ func BuildJenkinsJob(jobName string, params map[string]string, err error, jenkin
 	}
 
 	if build.IsGood(ctx) {
-		fmt.Println("Build succeeded")
+		endTime := time.Now().Local()
+		jenkinsDuration := endTime.Sub(startTime)
+		fmt.Printf("[%s] Jenkins build completed successfully! Jenkins execution time: %v\n",
+			endTime.Format("2006-01-02 15:04:05"), jenkinsDuration)
+
+		// 如果构建成功，监控pod更新
+		configPath := env.K8s.ConfigPath
+		if configPath == "" {
+			configPath = config.K8s.ConfigPath
+		}
+		if err := monitorPodRollout(ctx, env.K8s.Namespace, env.K8s.Deployment, configPath); err != nil {
+			log.Fatalf("Failed to monitor pod rollout: %s", err)
+		}
 	} else {
-		fmt.Println("")
-		fmt.Println("=============Build Failed Log=============")
+		endTime := time.Now().Local()
+		jenkinsDuration := endTime.Sub(startTime)
+		fmt.Printf("\n[%s] =============Build Failed Log=============\n", endTime.Format("2006-01-02 15:04:05"))
 		fmt.Print(build.GetConsoleOutput(ctx))
-		fmt.Println("=============Build Failed Log=============")
-		fmt.Println("")
+		fmt.Printf("\n[%s] =============Build Failed Log=============\n", endTime.Format("2006-01-02 15:04:05"))
+		fmt.Printf("[%s] Jenkins build failed after %v\n", endTime.Format("2006-01-02 15:04:05"), jenkinsDuration)
 		log.Fatalf("Build failed: %s", build.GetResult())
+	}
+}
+
+func monitorPodRollout(ctx context.Context, namespace, deploymentName string, configPath string) error {
+	startTime := time.Now().Local()
+	fmt.Printf("[%s] Starting pod rollout monitoring for deployment %s in namespace %s...\n",
+		startTime.Format("2006-01-02 15:04:05"), deploymentName, namespace)
+
+	var k8sConfig *rest.Config
+	var err error
+
+	// 如果提供了配置文件路径，使用指定的配置文件
+	if configPath != "" {
+		// 展开 ~ 到用户主目录
+		if strings.HasPrefix(configPath, "~/") {
+			homeDir, err := os.UserHomeDir()
+			if err != nil {
+				return fmt.Errorf("failed to get user home directory: %v", err)
+			}
+			configPath = filepath.Join(homeDir, configPath[2:])
+		}
+
+		k8sConfig, err = clientcmd.BuildConfigFromFlags("", configPath)
+		if err != nil {
+			return fmt.Errorf("failed to build config from flags: %v", err)
+		}
+	} else {
+		// 尝试使用集群内配置
+		k8sConfig, err = rest.InClusterConfig()
+		if err != nil {
+			// 如果集群内配置失败，尝试使用默认的 kubeconfig
+			k8sConfig, err = clientcmd.BuildConfigFromFlags("", filepath.Join(os.Getenv("HOME"), ".kube", "config"))
+			if err != nil {
+				return fmt.Errorf("failed to get k8s config: %v", err)
+			}
+		}
+	}
+
+	clientset, err := kubernetes.NewForConfig(k8sConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create kubernetes client: %v", err)
+	}
+
+	// 获取当前部署的版本
+	deployment, err := clientset.AppsV1().Deployments(namespace).Get(ctx, deploymentName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get deployment: %v", err)
+	}
+
+	// 等待新的pod准备就绪
+	for {
+		time.Sleep(3 * time.Second)
+
+		// 获取最新的部署状态
+		deployment, err = clientset.AppsV1().Deployments(namespace).Get(ctx, deploymentName, metav1.GetOptions{})
+		if err != nil {
+			return fmt.Errorf("failed to get deployment: %v", err)
+		}
+
+		// 检查部署是否完成
+		if deployment.Status.ReadyReplicas == *deployment.Spec.Replicas {
+			endTime := time.Now().Local()
+			rolloutDuration := endTime.Sub(startTime)
+			fmt.Printf("[%s] K8s rollout completed successfully! Rollout time: %v\n",
+				endTime.Format("2006-01-02 15:04:05"), rolloutDuration)
+			return nil
+		}
+
+		// 检查是否有错误
+		if deployment.Status.UnavailableReplicas > 0 {
+			endTime := time.Now().Local()
+			rolloutDuration := endTime.Sub(startTime)
+			return fmt.Errorf("[%s] K8s rollout failed after %v",
+				endTime.Format("2006-01-02 15:04:05"), rolloutDuration)
+		}
+
+		fmt.Printf("[%s] Waiting for pod rollout to complete... (Ready: %d/%d)\n",
+			time.Now().Local().Format("2006-01-02 15:04:05"),
+			deployment.Status.ReadyReplicas, *deployment.Spec.Replicas)
 	}
 }
